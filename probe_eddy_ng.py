@@ -1069,29 +1069,6 @@ class ProbeEddy:
 
     cmd_SETUP_help = "Setup"
 
-    def cmd_SETUP(self, gcmd: GCodeCommand):
-        if not self._xy_homed():
-            raise self._printer.command_error("X and Y must be homed before setup")
-
-        if self._z_homed():
-            # z-hop so that manual probe helper doesn't complain if we're already
-            # at the right place
-            self._z_hop()
-
-        # Now reset the axis so that we have a full range to calibrate with
-        th = self._printer.lookup_object("toolhead")
-        th_pos = th.get_position()
-        # XXX This is proably not correct for some printers?
-        zrange = th.get_kinematics().rails[2].get_range()
-        th_pos[2] = zrange[1] - 20.0
-        self._set_toolhead_position(th_pos, [2])
-
-        manual_probe.ManualProbeHelper(
-            self._printer,
-            gcmd,
-            lambda kin_pos: self.cmd_SETUP_next(gcmd, kin_pos),
-        )
-
     def cmd_SETUP_next(self, gcmd: GCodeCommand, kin_pos: Optional[List[float]]):
         if kin_pos is None:
             # User cancelled ManualProbeHelper
@@ -1139,16 +1116,23 @@ class ProbeEddy:
         # This is going to automate setup.
         # The setup state machine looks like this:
         # 1. Finding homing drive current
-        # 2. Finding tapping drive current
+        # 2. Finding optimal tapping drive current (continue searching even after first match)
         FINDING_HOMING = 1
         FINDING_TAP = 2
         DONE = 3
 
         start_drive_current = drive_current
         result_msg = None
+        
+        # Track the best candidates found
+        best_homing_dc = None
+        best_tap_dc = None
+        best_tap_mapping = None
+        best_tap_score = -1.0
 
         self._log_msg("setup: calibrating homing")
         state = FINDING_HOMING
+        
         while state < DONE:
             mapping, fth_rms, htf_rms = self._create_mapping(
                 self.params.calibration_z_max,
@@ -1184,46 +1168,154 @@ class ProbeEddy:
                     self._log_msg(f"calibration error rate is too high ({fth_rms}) at drive current {drive_current}.")
                     ok_for_homing = ok_for_tap = False
 
+            # Find first working homing DC, then continue searching for best tap DC
             if state == FINDING_HOMING and ok_for_homing:
+                best_homing_dc = drive_current
                 self._dc_to_fmap[drive_current] = mapping
                 self._reg_drive_current = drive_current
                 self._log_msg(f"using {drive_current} for homing.")
                 state = FINDING_TAP
+                # Don't increment drive_current here - test this same DC for tap first
 
-            if state == FINDING_TAP and ok_for_tap:
-                self._dc_to_fmap[drive_current] = mapping
-                self._tap_drive_current = drive_current
-                self._log_msg(f"using {drive_current} for tap.")
-                state = DONE
+            elif state == FINDING_TAP and ok_for_tap:
+                # For tap, prefer higher drive currents as they're more stable at temperature
+                # Only accept if this is better than what we have, or if we don't have one yet
+                tap_quality_score = self._calculate_tap_quality_score(mapping, fth_rms, drive_current)
+                
+                if best_tap_dc is None:
+                    # First valid tap DC found
+                    best_tap_dc = drive_current
+                    best_tap_mapping = mapping
+                    best_tap_score = tap_quality_score
+                    self._log_msg(f"found tap candidate at DC {drive_current} (quality: {tap_quality_score:.3f})")
+                else:
+                    # Compare with existing best
+                    if tap_quality_score > best_tap_score:
+                        best_tap_dc = drive_current
+                        best_tap_mapping = mapping
+                        best_tap_score = tap_quality_score
+                        self._log_msg(f"better tap candidate at DC {drive_current} (quality: {tap_quality_score:.3f} > {best_tap_score:.3f})")
+                    else:
+                        self._log_info(f"tap candidate at DC {drive_current} (quality: {tap_quality_score:.3f}) not better than current best")
+                
+                # Continue searching unless we've hit the max or found a good current
+                if (drive_current - start_drive_current >= max_dc_increase or 
+                    tap_quality_score > 0.9):
+                    state = DONE
 
             if state == DONE:
-                result_msg = "Setup success. Please check whether homing works with G28 Z, then check if tap works with PROBE_EDDY_NG_TAP."
                 break
 
             if drive_current - start_drive_current >= max_dc_increase:
-                # we've failed completely
+                # we've failed completely or reached our search limit
                 if state == FINDING_HOMING:
                     result_msg = "Failed to find homing drive current. (Have you checked the sensor height?)"
-                elif state == FINDING_TAP:
-                    result_msg = "Failed to find tap drive current, but homing is set up. (Have you checked the sensor height?)"
-                else:
-                    result_msg = "Unknown state?"
+                elif state == FINDING_TAP and best_homing_dc is not None:
+                    if best_tap_dc is None:
+                        result_msg = "Failed to find tap drive current, but homing is set up. (Have you checked the sensor height?)"
+                    else:
+                        state = DONE  # We found at least one tap candidate
                 break
 
-            # increase DC and keep going
+            # Always increment to test next drive current
             drive_current += 1
 
-        if state == DONE:
-            self._log_msg(result_msg)
+        # Finalize the results
+        if best_homing_dc is not None and best_tap_dc is not None and best_tap_mapping is not None:
+            # Set the final tap drive current and mapping
+            self._tap_drive_current = best_tap_dc
+            if best_tap_dc != best_homing_dc:
+                self._dc_to_fmap[best_tap_dc] = best_tap_mapping
+            
+            temp_warning = ""
+            if best_homing_dc == best_tap_dc:
+                temp_warning = " Note: Same drive current used for homing and tap - consider re-running setup with bed at print temperature if you experience temperature-related issues."
+            
+            result_msg = f"Setup success. Homing DC: {best_homing_dc}, Tap DC: {best_tap_dc} (quality: {best_tap_score:.3f}).{temp_warning} Please check whether homing works with G28 Z, then check if tap works with PROBE_EDDY_NG_TAP."
+            
+        elif best_homing_dc is not None:
+            if best_tap_dc is None or best_tap_mapping is None:
+                result_msg = "Failed to find tap drive current, but homing is set up. (Have you checked the sensor height?)"
+            else:
+                # This shouldn't happen with the logic above, but just in case
+                self._tap_drive_current = best_tap_dc
+                self._dc_to_fmap[best_tap_dc] = best_tap_mapping
+                result_msg = f"Homing setup successful with DC {best_homing_dc}, but tap setup had issues. Using tap DC {best_tap_dc}."
+        else:
+            result_msg = "Failed to find homing drive current. (Have you checked the sensor height?)"
+
+        if best_homing_dc is not None or best_tap_dc is not None:
+            if result_msg.startswith("Setup success") or result_msg.startswith("Homing setup successful"):
+                self._log_msg(result_msg)
+            else:
+                self._log_error(result_msg)
         else:
             self._log_error(result_msg)
 
-        if state > FINDING_HOMING:
+        if best_homing_dc is not None:
             self.reset_drive_current()
             self.save_config()
 
         self._z_not_homed()
 
+    def _calculate_tap_quality_score(self, mapping, fth_rms, drive_current):
+        """
+        Calculate a quality score for tap operations.
+        Higher drive currents and better accuracy get higher scores.
+        Returns a score between 0.0 and 1.0, where 1.0 is ideal.
+        """
+        score = 0.0
+        
+        # Prefer higher drive currents for temperature stability (40% weight)
+        # Scale so that DC 15 gets ~0.5, DC 16+ gets higher scores
+        dc_score = min(1.0, (drive_current - 10) / 15.0)
+        score += dc_score * 0.4
+        
+        # Prefer better accuracy - lower RMS error is better (30% weight)
+        if fth_rms is not None:
+            # Convert RMS error to quality score (0.025 is our threshold)
+            accuracy_score = max(0.0, 1.0 - (fth_rms / 0.025))
+            score += accuracy_score * 0.3
+        else:
+            # No RMS data, assume moderate quality
+            score += 0.5 * 0.3
+        
+        # Prefer better frequency spread - more sensitivity is better (20% weight)
+        if mapping is not None:
+            freq_spread = mapping.freq_spread()
+            # Good spread is 0.5% to 2.0%, excellent is >1.0%
+            if freq_spread >= 1.0:
+                spread_score = 1.0
+            elif freq_spread >= 0.5:
+                spread_score = freq_spread / 1.0
+            else:
+                spread_score = 0.0
+            score += spread_score * 0.2
+        
+        # Prefer better height range coverage for tap (10% weight)
+        if mapping is not None:
+            min_height, max_height = mapping.height_range
+            coverage_score = 0.0
+            
+            # Excellent tap coverage: down to ≤0.05mm and up to ≥2.5mm
+            if min_height <= 0.05:
+                coverage_score += 0.6
+            elif min_height <= 0.1:
+                coverage_score += 0.4
+            elif min_height <= 0.2:
+                coverage_score += 0.2
+                
+            if max_height >= 2.5:
+                coverage_score += 0.4
+            elif max_height >= 2.0:
+                coverage_score += 0.3
+            elif max_height >= 1.5:
+                coverage_score += 0.2
+                
+            score += min(1.0, coverage_score) * 0.1
+        
+        return min(1.0, score)
+    
     cmd_CALIBRATE_help = (
         "Calibrate the eddy current sensor. Specify DRIVE_CURRENT to calibrate for a different drive current "
         + "than the default. Specify START_Z to set a different calibration start point."
